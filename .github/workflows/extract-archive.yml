@@ -1,0 +1,91 @@
+name: Extract & Deploy 2016 PCI Services Archive
+
+on:
+  workflow_dispatch:
+    inputs:
+      from_timestamp:
+        description: 'Lookback start timestamp'
+        required: true
+        default: '20150101000000'
+      to_timestamp:
+        description: 'Target snapshot cutoff (March 13, 2016)'
+        required: true
+        default: '20160314000000'
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  extract_and_publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+
+      - name: Install Wayback Machine Downloader
+        run: gem install wayback_machine_downloader
+
+      - name: Download Original Unaltered Files from Internet Archive
+        run: |
+          wayback_machine_downloader http://pciservices.com \
+            --directory ./archive-site \
+            --from ${{ inputs.from_timestamp }} \
+            --to ${{ inputs.to_timestamp }} \
+            --concurrency 10
+
+      - name: Normalize Links to Clean Root-Relative Paths
+        run: |
+          find ./archive-site -type f \( -name "*.html" -o -name "*.htm" -o -name "*.css" -o -name "*.js" \) -exec sed -i \
+            -e 's|https\?://\(www\.\)\?pciservices\.com/|/|g' \
+            -e 's|https\?://\(www\.\)\?pciservices\.com|/|g' \
+            -e 's|http://ajax.googleapis.com|https://ajax.googleapis.com|g' \
+            -e 's|http://fonts.googleapis.com|https://fonts.googleapis.com|g' \
+            -e 's|http://code.jquery.com|https://code.jquery.com|g' {} +
+
+          touch ./archive-site/.nojekyll
+
+      - name: Commit Clean Root-Relative Site to Branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -B archive-files
+          git add archive-site/
+          git commit -m "Extract clean pciservices.com snapshot" || echo "No changes to commit"
+          git push -f origin archive-files
+
+      - name: Upload Clean Zip Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pciservices-2016-static-site
+          path: ./archive-site/
+
+      - name: Rewrite Subpaths Specifically for GitHub Pages
+        run: |
+          REPO_NAME="${{ github.event.repository.name }}"
+          find ./archive-site -type f \( -name "*.html" -o -name "*.htm" -o -name "*.css" -o -name "*.js" \) -exec sed -i \
+            -e "s|href=\"/\([^\"]*\)\"|href=\"/${REPO_NAME}/\1\"|g" \
+            -e "s|href='/\([^']*\)'|href='/${REPO_NAME}/\1'|g" \
+            -e "s|src=\"/\([^\"]*\)\"|src=\"/${REPO_NAME}/\1\"|g" \
+            -e "s|src='/\([^']*\)'|href='/${REPO_NAME}/\1'|g" \
+            -e "s|url(/\([^/][^)]*\))|url(/${REPO_NAME}/\1)|g" \
+            -e "s|url(\"/\([^\"]*\)\")|url(\"/${REPO_NAME}/\1\")|g" \
+            -e "s|url('/\([^']*\)')|url('/${REPO_NAME}/\1')|g" {} +
+
+      - name: Setup GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload GitHub Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: './archive-site'
+
+      - name: Deploy Interactive Site to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
