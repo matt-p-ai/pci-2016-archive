@@ -35,15 +35,15 @@ jobs:
           TO_TS: ${{ inputs.to_timestamp }}
         run: |
           pip install requests urllib3
-          python3 - << 'EOF'
+          python3 -u - << 'EOF'
           import os, time, urllib.parse, requests
-          from requests.adapters import HTTPAdapter
-          from urllib3.util.retry import Retry
 
           session = requests.Session()
-          retries = Retry(total=5, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
-          session.mount('https://', HTTPAdapter(max_retries=retries))
-          session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+              'Accept': '*/*',
+              'Connection': 'keep-alive'
+          })
 
           from_ts = os.environ.get('FROM_TS', '20150101000000')
           to_ts = os.environ.get('TO_TS', '20160314000000')
@@ -59,14 +59,19 @@ jobs:
           res.raise_for_status()
           rows = res.json()
 
+          # Filter out useless RSS feeds & duplicate pagination/captcha noise to cut file count down further
+          skip_patterns = ('/feed', '/comments/feed', '/images/captchas/')
           snapshots = {}
           for row in rows[1:]:
               ts, orig, status, mime = row
               parsed = urllib.parse.urlparse(orig)
               path = parsed.path if parsed.path else "/"
+              if any(pat in path.lower() for pat in skip_patterns):
+                  continue
               snapshots[path] = (ts, orig, mime)
 
-          print(f"Found {len(snapshots)} unique working files/pages. Downloading raw assets...")
+          total = len(snapshots)
+          print(f"Found {total} clean files/pages. Pacing at 1 request every 2.2s to avoid 429 blocks (~{int(total*2.3/60)} mins total)...")
           os.makedirs("./archive-site", exist_ok=True)
 
           for idx, (path, (ts, orig, mime)) in enumerate(snapshots.items(), 1):
@@ -82,22 +87,42 @@ jobs:
 
               os.makedirs(os.path.dirname(local_path), exist_ok=True)
               raw_url = f"https://web.archive.org/web/{ts}id_/{orig}"
-              try:
-                  r = session.get(raw_url, timeout=30)
-                  if r.status_code == 200:
-                      with open(local_path, "wb") as f:
-                          f.write(r.content)
-                      print(f"[{idx}/{len(snapshots)}] Saved: {local_path}")
-                  time.sleep(0.1)
-              except Exception as e:
-                  print(f"[{idx}/{len(snapshots)}] Skipped {orig}: {e}")
+
+              # Custom cooldown loop specifically for Wayback Machine's 429 rate limiter
+              saved = False
+              for attempt in range(1, 5):
+                  try:
+                      r = session.get(raw_url, timeout=30)
+                      if r.status_code == 200:
+                          with open(local_path, "wb") as f:
+                              f.write(r.content)
+                          print(f"[{idx}/{total}] Saved: {local_path}")
+                          saved = True
+                          break
+                      elif r.status_code == 429:
+                          wait = 25 * attempt
+                          print(f"  -> Rate limited (429) on item {idx}. Cooling down {wait}s (attempt {attempt}/4)...")
+                          time.sleep(wait)
+                      else:
+                          print(f"[{idx}/{total}] HTTP {r.status_code} (not in archive): {orig}")
+                          break
+                  except Exception as e:
+                      wait = 15 * attempt
+                      print(f"  -> Connection reset on item {idx}. Cooling down {wait}s (attempt {attempt}/4)...")
+                      time.sleep(wait)
+
+              if not saved and attempt == 4:
+                  print(f"[{idx}/{total}] Skipped after 4 cooldowns: {orig}")
+
+              # Polite 2.2-second steady delay keeps us safely under Wayback's 30 req/min firewall
+              time.sleep(2.2)
           EOF
 
       - name: Normalize Links to Clean Root-Relative Paths
         run: |
           find ./archive-site -type f \( -name "*.html" -o -name "*.htm" -o -name "*.css" -o -name "*.js" \) -exec sed -i \
-            -e 's|https\?://\(www\.\)\?pciservices\.com/|/|g' \
-            -e 's|https\?://\(www\.\)\?pciservices\.com|/|g' \
+            -e 's|https\?://\(www\.\)\?pciservices\.com\(:80\)\?/|/|g' \
+            -e 's|https\?://\(www\.\)\?pciservices\.com\(:80\)\?|/|g' \
             -e 's|http://ajax.googleapis.com|https://ajax.googleapis.com|g' \
             -e 's|http://fonts.googleapis.com|https://fonts.googleapis.com|g' \
             -e 's|http://code.jquery.com|https://code.jquery.com|g' {} +
